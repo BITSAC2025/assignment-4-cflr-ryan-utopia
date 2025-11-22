@@ -1,14 +1,4 @@
-/**
- * CFLR.cpp
- * @author kisslune 
- */
-
 #include "A4Header.h"
-
-#include <tuple>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
 
 using namespace SVF;
 using namespace llvm;
@@ -24,11 +14,10 @@ int main(int argc, char **argv)
 
     SVFIRBuilder builder;
     auto pag = builder.build();
-    pag->dump();
+    pag->dump("PAG");
 
     CFLR solver;
     solver.buildGraph(pag);
-    // TODO: complete this method
     solver.solve();
     solver.dumpResult();
 
@@ -39,129 +28,261 @@ int main(int argc, char **argv)
 
 void CFLR::solve()
 {
-    if (!graph)
-        return;
-
-    auto &succMap = graph->getSuccessorMap();
-    auto &predMap = graph->getPredecessorMap();
-
-    // Helper to insert a derived edge and enqueue it for further processing when it is new.
-    auto addEdgeIfAbsent = [&](unsigned src, unsigned dst, EdgeLabel label) {
-        if (!graph->hasEdge(src, dst, label))
+    std::unordered_set<unsigned> allNodes;
+    
+    for (auto &nodeItr : graph->getSuccessorMap())
+    {
+        unsigned src = nodeItr.first;
+        allNodes.insert(src);
+        
+        for (auto &lblItr : nodeItr.second)
         {
+            EdgeLabel label = lblItr.first;
+            for (auto dst : lblItr.second)
+            {
+                allNodes.insert(dst);
+                workList.push(CFLREdge(src, dst, label));
+            }
+        }
+    }
+    
+    auto addEdge = [this](unsigned src, unsigned dst, EdgeLabel label)
+    {
+        if (!graph->hasEdge(src, dst, label)) {
             graph->addEdge(src, dst, label);
             workList.push(CFLREdge(src, dst, label));
         }
     };
-
-    // Grammar encoded as unary and binary production rules.
-    std::unordered_map<EdgeLabel, std::vector<EdgeLabel>> unaryRules{
-            {Copy,    {VF}},
-            {CopyBar, {VFBar}},
-    };
-
-    std::vector<std::tuple<EdgeLabel, EdgeLabel, EdgeLabel>> binaryRules = {
-            {PT,     VFBar,   AddrBar},
-            {PTBar,  Addr,    VF},
-            {VF,     VF,      VF},
-            {VF,     SV,      Load},
-            {VF,     PV,      Load},
-            {VF,     Store,   VP},
-            {VFBar,  VFBar,   VFBar},
-            {VFBar,  LoadBar, SV},
-            {VFBar,  LoadBar, VP},
-            {VFBar,  PV,      StoreBar},
-            {VA,     LV,      Load},
-            {VA,     VFBar,   VA},
-            {VA,     VA,      VF},
-            {SV,     Store,   VA},
-            {SVBar,  VA,      StoreBar},
-            {PV,     PTBar,   VA},
-            {VP,     VA,      PT},
-            {LV,     LoadBar, VA},
-    };
-
-    std::unordered_map<EdgeLabel, std::vector<std::pair<EdgeLabel, EdgeLabel>>> leftRules;
-    std::unordered_map<EdgeLabel, std::vector<std::pair<EdgeLabel, EdgeLabel>>> rightRules;
-    for (const auto &[result, left, right] : binaryRules)
+    
+    for (auto node : allNodes)
     {
-        leftRules[left].emplace_back(result, right);
-        rightRules[right].emplace_back(result, left);
+        addEdge(node, node, VF);
+        addEdge(node, node, VFBar);
+        addEdge(node, node, VA);
     }
-
-    // Collect existing edges as worklist seeds and record all nodes for epsilon rules.
-    std::vector<CFLREdge> initialEdges;
-    std::unordered_set<unsigned> allNodes;
-    for (auto &srcEntry : succMap)
-    {
-        unsigned src = srcEntry.first;
-        allNodes.insert(src);
-        for (auto &labelEntry : srcEntry.second)
-        {
-            EdgeLabel lbl = labelEntry.first;
-            for (unsigned dst : labelEntry.second)
-            {
-                initialEdges.emplace_back(src, dst, lbl);
-                allNodes.insert(dst);
-            }
-        }
-    }
-
-    for (const auto &edge : initialEdges)
-        workList.push(edge);
-
-    // Non-terminals with epsilon productions yield self-loops on every node.
-    for (unsigned node : allNodes)
-    {
-        addEdgeIfAbsent(node, node, VF);
-        addEdgeIfAbsent(node, node, VFBar);
-        addEdgeIfAbsent(node, node, VA);
-    }
-
-    // Process worklist until closure is reached.
+    
     while (!workList.empty())
     {
         CFLREdge edge = workList.pop();
-
-        // Apply unary rules
-        if (auto itUnary = unaryRules.find(edge.label); itUnary != unaryRules.end())
+        unsigned x = edge.src;
+        unsigned z = edge.dst;
+        EdgeLabel label = edge.label;
+        
+        auto &succMap = graph->getSuccessorMap();
+        auto &predMap = graph->getPredecessorMap();
+        
+        if (label == VFBar && succMap.count(z) && succMap[z].count(AddrBar))
         {
-            for (EdgeLabel result : itUnary->second)
-                addEdgeIfAbsent(edge.src, edge.dst, result);
+            for (auto w : succMap[z][AddrBar])
+                addEdge(x, w, PT);
         }
-
-        // Apply binary rules where current edge is on the left-hand side component.
-        if (auto itLeft = leftRules.find(edge.label); itLeft != leftRules.end())
+        if (label == AddrBar && predMap.count(x) && predMap[x].count(VFBar))
         {
-            auto succIt = succMap.find(edge.dst);
-            if (succIt != succMap.end())
+            for (auto y : predMap[x][VFBar])
+                addEdge(y, z, PT);
+        }
+        
+        if (label == Addr && succMap.count(z) && succMap[z].count(VF))
+        {
+            for (auto w : succMap[z][VF])
+                addEdge(x, w, PTBar);
+        }
+        if (label == VF && predMap.count(x) && predMap[x].count(Addr))
+        {
+            for (auto y : predMap[x][Addr])
+                addEdge(y, z, PTBar);
+        }
+        
+        if (label == VF)
+        {
+            if (succMap.count(z) && succMap[z].count(VF))
             {
-                for (const auto &[result, rightLbl] : itLeft->second)
-                {
-                    auto succLblIt = succIt->second.find(rightLbl);
-                    if (succLblIt == succIt->second.end())
-                        continue;
-                    for (unsigned next : succLblIt->second)
-                        addEdgeIfAbsent(edge.src, next, result);
-                }
+                for (auto w : succMap[z][VF])
+                    addEdge(x, w, VF);
+            }
+            if (predMap.count(x) && predMap[x].count(VF))
+            {
+                for (auto y : predMap[x][VF])
+                    addEdge(y, z, VF);
             }
         }
-
-        // Apply binary rules where current edge is the right-hand side component.
-        if (auto itRight = rightRules.find(edge.label); itRight != rightRules.end())
+        
+        if (label == Copy)
         {
-            auto predIt = predMap.find(edge.src);
-            if (predIt != predMap.end())
+            addEdge(x, z, VF);
+        }
+        
+        if (label == SV && succMap.count(z) && succMap[z].count(Load))
+        {
+            for (auto w : succMap[z][Load])
+                addEdge(x, w, VF);
+        }
+        if (label == Load && predMap.count(x) && predMap[x].count(SV))
+        {
+            for (auto y : predMap[x][SV])
+                addEdge(y, z, VF);
+        }
+        
+        if (label == PV && succMap.count(z) && succMap[z].count(Load))
+        {
+            for (auto w : succMap[z][Load])
+                addEdge(x, w, VF);
+        }
+        if (label == Load && predMap.count(x) && predMap[x].count(PV))
+        {
+            for (auto y : predMap[x][PV])
+                addEdge(y, z, VF);
+        }
+        
+        if (label == Store && succMap.count(z) && succMap[z].count(VP))
+        {
+            for (auto w : succMap[z][VP])
+                addEdge(x, w, VF);
+        }
+        if (label == VP && predMap.count(x) && predMap[x].count(Store))
+        {
+            for (auto y : predMap[x][Store])
+                addEdge(y, z, VF);
+        }
+        
+        if (label == VFBar)
+        {
+            if (succMap.count(z) && succMap[z].count(VFBar))
             {
-                for (const auto &[result, leftLbl] : itRight->second)
-                {
-                    auto predLblIt = predIt->second.find(leftLbl);
-                    if (predLblIt == predIt->second.end())
-                        continue;
-                    for (unsigned prev : predLblIt->second)
-                        addEdgeIfAbsent(prev, edge.dst, result);
-                }
+                for (auto w : succMap[z][VFBar])
+                    addEdge(x, w, VFBar);
             }
+            if (predMap.count(x) && predMap[x].count(VFBar))
+            {
+                for (auto y : predMap[x][VFBar])
+                    addEdge(y, z, VFBar);
+            }
+        }
+        
+        if (label == CopyBar)
+        {
+            addEdge(x, z, VFBar);
+        }
+        
+        if (label == LoadBar && succMap.count(z) && succMap[z].count(SVBar))
+        {
+            for (auto w : succMap[z][SVBar])
+                addEdge(x, w, VFBar);
+        }
+        if (label == SVBar && predMap.count(x) && predMap[x].count(LoadBar))
+        {
+            for (auto y : predMap[x][LoadBar])
+                addEdge(y, z, VFBar);
+        }
+        
+        if (label == LoadBar && succMap.count(z) && succMap[z].count(VP))
+        {
+            for (auto w : succMap[z][VP])
+                addEdge(x, w, VFBar);
+        }
+        if (label == VP && predMap.count(x) && predMap[x].count(LoadBar))
+        {
+            for (auto y : predMap[x][LoadBar])
+                addEdge(y, z, VFBar);
+        }
+        
+        if (label == PV && succMap.count(z) && succMap[z].count(StoreBar))
+        {
+            for (auto w : succMap[z][StoreBar])
+                addEdge(x, w, VFBar);
+        }
+        if (label == StoreBar && predMap.count(x) && predMap[x].count(PV))
+        {
+            for (auto y : predMap[x][PV])
+                addEdge(y, z, VFBar);
+        }
+        
+        if (label == LV && succMap.count(z) && succMap[z].count(Load))
+        {
+            for (auto w : succMap[z][Load])
+                addEdge(x, w, VA);
+        }
+        if (label == Load && predMap.count(x) && predMap[x].count(LV))
+        {
+            for (auto y : predMap[x][LV])
+                addEdge(y, z, VA);
+        }
+        
+        if (label == VFBar && succMap.count(z) && succMap[z].count(VA))
+        {
+            for (auto w : succMap[z][VA])
+                addEdge(x, w, VA);
+        }
+        if (label == VA && predMap.count(x) && predMap[x].count(VFBar))
+        {
+            for (auto y : predMap[x][VFBar])
+                addEdge(y, z, VA);
+        }
+        
+        if (label == VA && succMap.count(z) && succMap[z].count(VF))
+        {
+            for (auto w : succMap[z][VF])
+                addEdge(x, w, VA);
+        }
+        if (label == VF && predMap.count(x) && predMap[x].count(VA))
+        {
+            for (auto y : predMap[x][VA])
+                addEdge(y, z, VA);
+        }
+        
+        if (label == Store && succMap.count(z) && succMap[z].count(VA))
+        {
+            for (auto w : succMap[z][VA])
+                addEdge(x, w, SV);
+        }
+        if (label == VA && predMap.count(x) && predMap[x].count(Store))
+        {
+            for (auto y : predMap[x][Store])
+                addEdge(y, z, SV);
+        }
+        
+        if (label == VA && succMap.count(z) && succMap[z].count(StoreBar))
+        {
+            for (auto w : succMap[z][StoreBar])
+                addEdge(x, w, SVBar);
+        }
+        if (label == StoreBar && predMap.count(x) && predMap[x].count(VA))
+        {
+            for (auto y : predMap[x][VA])
+                addEdge(y, z, SVBar);
+        }
+        
+        if (label == PTBar && succMap.count(z) && succMap[z].count(VA))
+        {
+            for (auto w : succMap[z][VA])
+                addEdge(x, w, PV);
+        }
+        if (label == VA && predMap.count(x) && predMap[x].count(PTBar))
+        {
+            for (auto y : predMap[x][PTBar])
+                addEdge(y, z, PV);
+        }
+        
+        if (label == VA && succMap.count(z) && succMap[z].count(PT))
+        {
+            for (auto w : succMap[z][PT])
+                addEdge(x, w, VP);
+        }
+        if (label == PT && predMap.count(x) && predMap[x].count(VA))
+        {
+            for (auto y : predMap[x][VA])
+                addEdge(y, z, VP);
+        }
+        
+        if (label == LoadBar && succMap.count(z) && succMap[z].count(VA))
+        {
+            for (auto w : succMap[z][VA])
+                addEdge(x, w, LV);
+        }
+        if (label == VA && predMap.count(x) && predMap[x].count(LoadBar))
+        {
+            for (auto y : predMap[x][LoadBar])
+                addEdge(y, z, LV);
         }
     }
 }
